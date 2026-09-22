@@ -1461,7 +1461,8 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
                 Whether the adapter should be trainable or not. If `False`, the adapter will be frozen and can only be
                 used for inference.
             torch_device (`str`, *optional*, defaults to None):
-                The device to load the adapter on. If `None`, the device will be inferred.
+                The device to load the adapter on. If `None`, the device of the base model's parameters is used
+                when they all live on a single device, otherwise the device is inferred.
             autocast_adapter_dtype (`bool`, *optional*, defaults to `True`):
                 Whether to autocast the adapter dtype. Defaults to `True`. Right now, this will only cast adapter
                 weights using float16 and bfloat16 to float32, as this is typically required for stable training, and
@@ -1483,7 +1484,19 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
 
         hf_hub_download_kwargs, kwargs = self._split_kwargs(kwargs)
         if torch_device is None:
-            torch_device = infer_device()
+            # Prefer the device of the base model's parameters over infer_device(). The adapter weights are only
+            # copied into the existing parameters afterwards, so loading them onto a different device first is
+            # wasted at best. In particular, torch.cuda.is_available() can report True without a usable GPU (e.g.
+            # Hugging Face ZeroGPU's CUDA emulation), which made load_adapter crash with safetensors >= 0.8 while
+            # every base model parameter was on CPU. Fall back to infer_device() for sharded or offloaded models
+            # whose parameters span multiple devices (or none at all).
+            # See https://github.com/huggingface/peft/issues/3793
+            base_model_devices = {param.device for param in self.base_model.parameters()}
+            base_model_devices.discard(torch.device("meta"))
+            if len(base_model_devices) == 1:
+                torch_device = str(next(iter(base_model_devices)))
+            else:
+                torch_device = infer_device()
 
         if adapter_name not in self.peft_config:
             # load the config

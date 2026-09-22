@@ -862,3 +862,32 @@ class TestTaskTypeModulesToSave:
 
         assert user_list == ["my_head"]
         assert model.peft_config["other"].modules_to_save == ["my_head"] + head_names
+
+
+def test_load_adapter_device_follows_base_model_on_cpu(tmp_path):
+    # Regression test for https://github.com/huggingface/peft/issues/3793: when torch_device is None, load_adapter
+    # must load the adapter weights onto the device the base model's parameters live on instead of blindly trusting
+    # torch.cuda.is_available(). On Hugging Face ZeroGPU Spaces, torch.cuda.is_available() returns True under the
+    # CUDA emulation even though no GPU is attached, which made safetensors >= 0.8 crash with a pin_memory
+    # RuntimeError while every base model parameter was on CPU.
+    from peft.utils.save_and_load import load_peft_weights
+
+    model_id = "hf-internal-testing/tiny-random-OPTForCausalLM"
+
+    with hub_online_once(model_id):
+        base_model = AutoModelForCausalLM.from_pretrained(model_id)
+        get_peft_model(base_model, LoraConfig(r=4, target_modules=["q_proj", "v_proj"])).save_pretrained(tmp_path)
+        fresh_base_model = AutoModelForCausalLM.from_pretrained(model_id)
+
+    assert {str(p.device) for p in fresh_base_model.parameters()} == {"cpu"}
+
+    with (
+        # Mimic ZeroGPU's CUDA emulation: only is_available() lies, nothing else.
+        patch("torch.cuda.is_available", lambda: True),
+        patch("peft.peft_model.load_peft_weights", wraps=load_peft_weights) as spy_load_peft_weights,
+        hub_online_once(model_id),
+    ):
+        loaded_model = PeftModel.from_pretrained(fresh_base_model, tmp_path)
+
+    assert spy_load_peft_weights.call_args.kwargs["device"] == "cpu"
+    assert {str(p.device) for name, p in loaded_model.named_parameters() if "lora_" in name} == {"cpu"}
